@@ -1,0 +1,429 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  A Network Error Logging (NEL) deployment, by James Bromberger <james@rcpt.to>.
+  NO warranty, expressed or implied. YMMV.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Parameters
+# ──────────────────────────────────────────────────────────────────────────────
+Parameters:
+  Runtime:
+    Type: String
+    Default: python3.13
+    Description: Lambda Python runtime version.
+
+  TablePrefix:
+    Type: String
+    Default: "NEL-"
+    Description: Prefix applied to all DynamoDB table names and the Lambda function name.
+
+  ReportRetentionDays:
+    Type: Number
+    Default: 60
+    # CloudWatch Logs only accepts specific values for RetentionInDays.
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: >
+      Number of days to retain Lambda log events. Also used as the DynamoDB TTL for reports
+      (via the TTL attribute written by the Lambda function).
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Resources
+# ──────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── CloudWatch Log Group ─────────────────────────────────────────────────────
+  # Create the log group explicitly so we can set a retention policy.
+  # The name must match the name Lambda will use: /aws/lambda/<FunctionName>.
+  NelReceiveFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${TablePrefix}NELReceiveFunction"
+      RetentionInDays: !Ref ReportRetentionDays
+
+  # ── DynamoDB: Config ─────────────────────────────────────────────────────────
+  NELConfigTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}Config"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: Id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: Id
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ── DynamoDB: Reports ─────────────────────────────────────────────────────────
+  NELReportsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}Reports"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ReportID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ReportID
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+
+  # ── IAM Role ──────────────────────────────────────────────────────────────────
+  NELReceiveFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${TablePrefix}ReportProcessorRole"
+      Description: Execution role for the NEL report processor Lambda function.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${TablePrefix}Report-CWLogs-DynamoDB"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # CloudWatch Logs – scoped to this account and region only
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+
+              # DynamoDB – write access to the Reports table only
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt NELReportsTable.Arn
+
+              # DynamoDB – read access to the Config table only
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource: !GetAtt NELConfigTable.Arn
+
+  # ── Lambda Function ───────────────────────────────────────────────────────────
+  # NOTE: DependsOn ensures the log group (and its retention policy) exists before
+  # the function is created, preventing Lambda from auto-creating an unmanaged group.
+  NELReceiveFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: NelReceiveFunctionLogGroup
+    Properties:
+      FunctionName: !Sub "${TablePrefix}NELReceiveFunction"
+      Description: Receives, validates, and persists Network Error Logging (NEL) reports.
+      Runtime: !Ref Runtime
+      Architectures:
+        - arm64
+      PackageType: Zip
+      MemorySize: 512
+      # NEL collectors must respond quickly; reports are fire-and-forget from the browser.
+      Timeout: 10
+      Handler: index.lambda_handler
+      Role: !GetAtt NELReceiveFunctionRole.Arn
+      Environment:
+        Variables:
+          TablePrefix: !Ref TablePrefix
+          ReportRetentionDays: !Ref ReportRetentionDays
+          ConfigTable: !Ref NELConfigTable
+          ReportTable: !Ref NELReportsTable
+      Code:
+        ZipFile: |
+          import json
+          import re
+          import logging
+          import boto3
+          import ipaddress
+          import datetime
+          import uuid
+          import os
+          from urllib.parse import urlparse
+          from boto3.dynamodb.conditions import Attr
+
+          env_region = os.environ.get('AWS_REGION', 'us-east-1')
+          config_table_name = os.environ['ConfigTable']
+          report_table_name = os.environ['ReportTable']
+          report_retention_days = int(os.environ.get('ReportRetentionDays', '60'))
+
+          LOGLEVEL = os.environ.get('LOGLEVEL', 'INFO').upper()
+          LEVEL_MAP = {
+              "DEBUG":    logging.DEBUG,
+              "INFO":     logging.INFO,
+              "WARNING":  logging.WARNING,
+              "ERROR":    logging.ERROR,
+              "CRITICAL": logging.CRITICAL,
+          }
+          logger = logging.getLogger()
+          logger.setLevel(LEVEL_MAP.get(LOGLEVEL, logging.INFO))
+
+          dynamodb = boto3.resource('dynamodb', region_name=env_region)
+          config_table = dynamodb.Table(config_table_name)
+          report_table = dynamodb.Table(report_table_name)
+
+          # NEL reports are submitted as application/reports+json (W3C Reporting API)
+          NEL_CONTENT_TYPE = 'application/reports+json'
+          MAX_BODY_BYTES = 1024 * 1024  # 1 MB
+
+
+          def lambda_handler(event, context):
+              logger.debug("Event: %s", event)
+
+              if not _content_type_ok(event):
+                  logger.warning("Rejected: invalid or missing Content-Type header")
+                  return _response(415, "rejected", "Content-Type must be {}".format(NEL_CONTENT_TYPE))
+
+              address = report_src_addr(event)
+              if address is not False:
+                  if report_ip_banned(address):
+                      logger.warning("Rejected: banned IP %s", address)
+                      return _response(403, "rejected", "Report rejected from IP {}".format(address))
+                  if not report_ip_permitted(address):
+                      logger.warning("Rejected: IP %s not in permitted list", address)
+                      return _response(403, "rejected", "Report rejected from IP {}".format(address))
+
+              if event.get('requestContext', {}).get('http', {}).get('method', '').lower() == 'options':
+                  logger.debug("CORS pre-flight request")
+                  return {'statusCode': 204}
+
+              if not report_hostname_permitted(event):
+                  return _response(403, "rejected", "Reports for this subject are not allowed")
+
+              report_uuid = save_report(event, address)
+              if not report_uuid:
+                  return _response(500, "error", "Failed to persist report")
+
+              logger.info("Accepted report %s from %s", report_uuid, address)
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({"Status": "accepted", "ReportID": report_uuid}),
+              }
+
+
+          # ── Persistence ──────────────────────────────────────────────────────
+
+          def save_report(event, address):
+              """Persist the raw report body to DynamoDB. Returns the report UUID or False."""
+              report_uuid = uuid.uuid4().hex
+              client_ip_str = str(address)
+              now = datetime.datetime.now(datetime.timezone.utc)
+              ttl_epoch = int((now + datetime.timedelta(days=report_retention_days)).timestamp())
+
+              logger.info("Saving report %s for IP %s", report_uuid, client_ip_str)
+              response = report_table.put_item(
+                  Item={
+                      "ReportID":   report_uuid,
+                      "Body":       event['body'],
+                      "ReportTime": now.isoformat(),
+                      "ClientIp":   client_ip_str,
+                      "TTL":        ttl_epoch,       # drives DynamoDB TTL expiry
+                  }
+              )
+              if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+                  return report_uuid
+              logger.error("DynamoDB put_item returned HTTP %s for report %s",
+                           response['ResponseMetadata']['HTTPStatusCode'], report_uuid)
+              return False
+
+
+          # ── IP-based access control ───────────────────────────────────────────
+
+          def _get_config_networks(config_name):
+              """Return a list of ip_network objects from a Config table item, or None on error."""
+              response = config_table.scan(
+                  FilterExpression=Attr('ConfigName').eq(config_name)
+              )
+              items = response.get('Items', [])
+              if not items:
+                  return []
+              if len(items) != 1:
+                  logger.warning("Expected 1 item for %s, found %d", config_name, len(items))
+                  return None
+              networks = []
+              for entry in items[0].get('IPs', []):
+                  try:
+                      networks.append(ipaddress.ip_network(entry, strict=False))
+                  except ValueError as exc:
+                      logger.error("%s: invalid network %r: %s", config_name, entry, exc)
+                      return None
+              return networks
+
+
+          def report_ip_banned(address):
+              networks = _get_config_networks("BannedIPs")
+              if not networks:
+                  return False
+              for network in networks:
+                  if address.version == network.version and address in network:
+                      logger.info("%s is banned (matched %s)", address, network)
+                      return True
+              return False
+
+
+          def report_ip_permitted(address):
+              """Return True if address is allowed. An empty list means open access."""
+              networks = _get_config_networks("PermittedIPs")
+              if networks is None:
+                  return False  # config error – fail closed
+              if not networks:
+                  return True   # no restrictions configured
+              for network in networks:
+                  if address.version == network.version and address in network:
+                      logger.info("Address %s is permitted (matched %s)", address, network)
+                      return True
+              logger.warning("Address %s not in any permitted network", address)
+              return False
+
+
+          # ── Hostname-based access control ─────────────────────────────────────
+
+          def report_hostname_permitted(event):
+              """Validate body and check each report URL against the banned hostname list."""
+              if 'body' not in event:
+                  logger.warning("Rejected: no body in event")
+                  return False
+
+              if len(event['body']) > MAX_BODY_BYTES:
+                  logger.warning("Rejected: body too large (%d bytes)", len(event['body']))
+                  return False
+
+              try:
+                  reports = json.loads(event['body'])
+              except (json.JSONDecodeError, TypeError) as exc:
+                  logger.warning("Rejected: body JSON parse error: %s", exc)
+                  return False
+
+              if not isinstance(reports, list):
+                  logger.warning("Rejected: body is not a JSON array")
+                  return False
+
+              # Fetch banned hostnames config once, outside the per-report loop
+              response = config_table.scan(
+                  FilterExpression=Attr('ConfigName').eq("BannedServerHostnames")
+              )
+              banned_items = response.get('Items', [])
+
+              for report in reports:
+                  if 'url' not in report:
+                      logger.warning("Rejected: report missing 'url' field")
+                      return False
+                  hostname = urlparse(report['url']).netloc
+                  for item in banned_items:
+                      for expression in item.get('Hostname', []):
+                          if re.search(expression + "$", hostname):
+                              logger.warning("Rejected: %s matched banned pattern %r", hostname, expression)
+                              return False
+
+              return True
+
+
+          # ── Source address helpers ────────────────────────────────────────────
+
+          def report_src_addr(event):
+              """Extract the caller's IP address from the Lambda Function URL request context."""
+              try:
+                  return ipaddress.ip_address(
+                      event['requestContext']['http']['sourceIp']
+                  )
+              except (KeyError, TypeError, ValueError) as exc:
+                  logger.warning("Could not parse source IP: %s", exc)
+                  return False
+
+
+          def parse_X_Forwarded_For(event):
+              """Parse public IP addresses from X-Forwarded-For, skipping loopback/private."""
+              xff = event.get('headers', {}).get('X-Forwarded-For')
+              if not xff:
+                  return False
+              addresses = []
+              for part in xff.split(','):
+                  try:
+                      addr = ipaddress.ip_address(part.strip())
+                      if addr.is_loopback or addr.is_private:
+                          logger.debug("X-Forwarded-For %s is loopback/private – skipping", addr)
+                      else:
+                          addresses.append(addr)
+                  except ValueError as exc:
+                      logger.warning("X-Forwarded-For parse error for %r: %s", part.strip(), exc)
+                      return False
+              return addresses
+
+
+          # ── Internal helpers ──────────────────────────────────────────────────
+
+          def _content_type_ok(event):
+              headers = event.get('headers') or {}
+              ct = headers.get('content-type') or headers.get('Content-Type') or ''
+              return ct.lower().startswith(NEL_CONTENT_TYPE)
+
+
+          def _response(status_code, status, message):
+              body = {"Status": status}
+              if message:
+                  body["Message"] = message
+              return {
+                  'statusCode': status_code,
+                  'body': json.dumps(body),
+              }
+
+  # ── Lambda Function URL ───────────────────────────────────────────────────────
+  # AuthType NONE is intentional: browsers submit NEL reports without credentials.
+  # Consider adding an AWS WAF WebACL association for rate limiting and geo-blocking.
+  NELReceiveFunctionURL:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE
+      TargetFunctionArn: !GetAtt NELReceiveFunction.Arn
+      Cors:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - "*"
+        AllowHeaders:
+          - content-type
+          - Content-Length
+        MaxAge: 30
+
+  # Allow public invocations through the Function URL
+  NELReceiveFunctionURLPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt NELReceiveFunction.Arn
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Outputs
+# ──────────────────────────────────────────────────────────────────────────────
+Outputs:
+  URL:
+    Description: Lambda Function URL for NEL report submissions.
+    Value: !GetAtt NELReceiveFunctionURL.FunctionUrl
+
+  ReportTo:
+    Description: >
+      Copy this value verbatim as your Report-To (or Reporting-Endpoints) HTTP response header.
+      max-age is set to 60 days (5 184 000 seconds).
+    Value: !Join
+      - ""
+      - - '{"group":"default","max_age":5184000,"endpoints":[{"url":"'
+        - !GetAtt NELReceiveFunctionURL.FunctionUrl
+        - '"}]}'
+
+  NEL:
+    Description: >
+      Copy this value verbatim as your NEL HTTP response header.
+      failure_fraction 1.0 reports every failure; lower it in high-traffic production use.
+    Value: '{"report_to":"default","max_age":86400,"failure_fraction":1.0}'
