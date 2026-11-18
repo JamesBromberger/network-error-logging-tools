@@ -12,6 +12,7 @@ from boto3.dynamodb.conditions import Attr
 env_region = os.environ.get('AWS_REGION', 'us-east-1')
 env_config = os.environ.get('NEL_CONFIG', 'NEL.Config')
 env_reports = os.environ.get('NEL_REPORTS', 'NEL.Reports')
+env_reports_ttl_days = os.environ.get('NEL_REPORTS_TTL_DAYS', '30')
 env_loglevel = os.environ.get('LOGLEVEL', 'INFO').upper()
 env_maxbodykb = int(os.environ.get('MAX_BODY_KB', '100'))
 
@@ -77,6 +78,7 @@ def save_report(event, address):
     """Persist the raw report body to DynamoDB. Returns the report UUID or False."""
     report_uuid = uuid.uuid4().hex
     client_ip_str = str(address)
+    ttl = int(datetime.datetime.now().timestamp()) + (int(env_reports_ttl_days) * 86400)
     logger.info("Saving report %s for IP %s", report_uuid, client_ip_str)
     response = report_table.put_item(
         Item={
@@ -84,6 +86,7 @@ def save_report(event, address):
             "Body": event['body'],
             "ReportTime": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "ClientIp": client_ip_str,
+            "TTL": ttl
         }
     )
     if response['ResponseMetadata']['HTTPStatusCode'] == 200:
@@ -113,11 +116,11 @@ def _get_config_networks(config_name):
     if len(items) != 1:
         logger.warning("Expected 1 item for %s, found %d", config_name, len(items))
         return None
-    
+
     ip_list = []
     for ip in items[0].get('IPs', []):
         ip_list.append(ip)
-    
+
     if not isinstance(ip_list, list):
         logger.error("IPs field for %s is not a list", config_name)
         return None

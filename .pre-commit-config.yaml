@@ -1,0 +1,6 @@
+repos:
+  - repo: https://github.com/aws-cloudformation/cfn-lint
+    rev: v1.60.1  # Replace with the latest release tag
+    hooks:
+      - id: cfn-lint
+        files: endpoint/.*\.yaml$

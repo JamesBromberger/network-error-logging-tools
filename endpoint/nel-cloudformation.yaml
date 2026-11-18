@@ -9,13 +9,28 @@ Description: >
 Parameters:
   Runtime:
     Type: String
-    Default: python3.13
+    Default: python3.14
     Description: Lambda Python runtime version.
 
   TablePrefix:
     Type: String
     Default: "NEL-"
-    Description: Prefix applied to all DynamoDB table names and the Lambda function name.
+    Description: Prefix applied to all DynamoDB table names, Lambda function name, and log group names.
+
+  NELConfigTableName:
+    Type: String
+    Default: "Config"
+    Description: "When prepended to the prefix, the table holding all config for this deployment"
+
+  NELReportTableName:
+    Type: String
+    Default: "Reports"
+    Description: "When prepended to the prefix, the table holding all submitted reports for this deployment"
+
+  LogLevel:
+    Type: String
+    Default: "INFO"
+    Description: Logging level for the Lambda function
 
   ReportRetentionDays:
     Type: Number
@@ -44,7 +59,7 @@ Resources:
   NELConfigTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: !Sub "${TablePrefix}Config"
+      TableName: !Sub "${TablePrefix}${NELConfigTableName}"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: Id
@@ -61,7 +76,7 @@ Resources:
   NELReportsTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: !Sub "${TablePrefix}Reports"
+      TableName: !Sub "${TablePrefix}${NELReportTableName}"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: ReportID
@@ -135,10 +150,10 @@ Resources:
       Role: !GetAtt NELReceiveFunctionRole.Arn
       Environment:
         Variables:
-          TablePrefix: !Ref TablePrefix
-          ReportRetentionDays: !Ref ReportRetentionDays
-          ConfigTable: !Ref NELConfigTable
-          ReportTable: !Ref NELReportsTable
+          NEL_CONFIG: !Sub "${TablePrefix}${NELConfigTableName}"
+          NEL_REPORTS: !Sub "${TablePrefix}${NELReportTableName}"
+          NEL_REPORTS_TTL_DAYS: !Ref ReportRetentionDays
+          NEL_LOGLEVEL: !Ref LogLevel
       Code:
         ZipFile: |
           import json
@@ -153,81 +168,83 @@ Resources:
           from boto3.dynamodb.conditions import Attr
 
           env_region = os.environ.get('AWS_REGION', 'us-east-1')
-          config_table_name = os.environ['ConfigTable']
-          report_table_name = os.environ['ReportTable']
-          report_retention_days = int(os.environ.get('ReportRetentionDays', '60'))
+          env_config = os.environ.get('NEL_CONFIG', 'NEL.Config')
+          env_reports = os.environ.get('NEL_REPORTS', 'NEL.Reports')
+          env_reports_ttl_days = os.environ.get('NEL_REPORTS_TTL_DAYS', '30')
+          env_loglevel = os.environ.get('NEL_LOGLEVEL', 'INFO').upper()
+          env_maxbodykb = int(os.environ.get('MAX_BODY_KB', '100'))
 
-          LOGLEVEL = os.environ.get('LOGLEVEL', 'INFO').upper()
+          # Map potential ENV strings to standard logging constants safely
           LEVEL_MAP = {
-              "DEBUG":    logging.DEBUG,
-              "INFO":     logging.INFO,
-              "WARNING":  logging.WARNING,
-              "ERROR":    logging.ERROR,
-              "CRITICAL": logging.CRITICAL,
+              "DEBUG": logging.DEBUG,
+              "INFO": logging.INFO,
+              "WARNING": logging.WARNING,
+              "ERROR": logging.ERROR,
+              "CRITICAL": logging.CRITICAL
           }
+          # Get the valid numeric level, default to logging.INFO if string is invalid
+          target_level = LEVEL_MAP.get(raw_level, logging.INFO)
+
           logger = logging.getLogger()
-          logger.setLevel(LEVEL_MAP.get(LOGLEVEL, logging.INFO))
+          logger.setLevel(target_level)
 
           dynamodb = boto3.resource('dynamodb', region_name=env_region)
-          config_table = dynamodb.Table(config_table_name)
-          report_table = dynamodb.Table(report_table_name)
+          config_table = dynamodb.Table(env_config)
+          report_table = dynamodb.Table(env_reports)
 
-          # NEL reports are submitted as application/reports+json (W3C Reporting API)
+          # NEL reports are submitted as application/reports+json (RFC 8941 / W3C Reporting API)
           NEL_CONTENT_TYPE = 'application/reports+json'
-          MAX_BODY_BYTES = 1024 * 1024  # 1 MB
+          MAX_BODY_BYTES = 1024 * env_maxbodykb
 
 
           def lambda_handler(event, context):
               logger.debug("Event: %s", event)
 
+              # Validate Content-Type header
               if not _content_type_ok(event):
                   logger.warning("Rejected: invalid or missing Content-Type header")
-                  return _response(415, "rejected", "Content-Type must be {}".format(NEL_CONTENT_TYPE))
+                  return _response(415, "Unsupported Media Type", "Content-Type must be {}".format(NEL_CONTENT_TYPE))
 
               address = report_src_addr(event)
               if address is not False:
                   if report_ip_banned(address):
                       logger.warning("Rejected: banned IP %s", address)
-                      return _response(403, "rejected", "Report rejected from IP {}".format(address))
+                      return _response(403, "rejected", "Your report was rejected from your IP address {}".format(address))
                   if not report_ip_permitted(address):
                       logger.warning("Rejected: IP %s not in permitted list", address)
-                      return _response(403, "rejected", "Report rejected from IP {}".format(address))
-
-              if event.get('requestContext', {}).get('http', {}).get('method', '').lower() == 'options':
-                  logger.debug("CORS pre-flight request")
-                  return {'statusCode': 204}
+                      return _response(403, "rejected", "Your report was rejected from your IP address {}".format(address))
 
               if not report_hostname_permitted(event):
-                  return _response(403, "rejected", "Reports for this subject are not allowed")
+                  return _response(403, "rejected", "Reports for subject not allowed")
 
               report_uuid = save_report(event, address)
               if not report_uuid:
-                  return _response(500, "error", "Failed to persist report")
+                  return _response(403, "rejected", None)
 
               logger.info("Accepted report %s from %s", report_uuid, address)
               return {
                   'statusCode': 200,
-                  'body': json.dumps({"Status": "accepted", "ReportID": report_uuid}),
+                  'body': json.dumps({"Status": "accepted", "ReportID": report_uuid})
               }
 
 
-          # ── Persistence ──────────────────────────────────────────────────────
+          # ---------------------------------------------------------------------------
+          # Persistence
+          # ---------------------------------------------------------------------------
 
           def save_report(event, address):
               """Persist the raw report body to DynamoDB. Returns the report UUID or False."""
               report_uuid = uuid.uuid4().hex
               client_ip_str = str(address)
-              now = datetime.datetime.now(datetime.timezone.utc)
-              ttl_epoch = int((now + datetime.timedelta(days=report_retention_days)).timestamp())
-
+              ttl = int(datetime.datetime.now().timestamp()) + (int(env_reports_ttl_days) * 86400)
               logger.info("Saving report %s for IP %s", report_uuid, client_ip_str)
               response = report_table.put_item(
                   Item={
-                      "ReportID":   report_uuid,
-                      "Body":       event['body'],
-                      "ReportTime": now.isoformat(),
-                      "ClientIp":   client_ip_str,
-                      "TTL":        ttl_epoch,       # drives DynamoDB TTL expiry
+                      "ReportID": report_uuid,
+                      "Body": event['body'],
+                      "ReportTime": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                      "ClientIp": client_ip_str,
+                      "TTL": ttl
                   }
               )
               if response['ResponseMetadata']['HTTPStatusCode'] == 200:
@@ -237,10 +254,17 @@ Resources:
               return False
 
 
-          # ── IP-based access control ───────────────────────────────────────────
+          # ---------------------------------------------------------------------------
+          # IP-based access control
+          # ---------------------------------------------------------------------------
 
           def _get_config_networks(config_name):
-              """Return a list of ip_network objects from a Config table item, or None on error."""
+              """Fetch ip_network objects from a NEL.Config item.
+
+              Returns:
+                  list[ipaddress.IPv4Network | ipaddress.IPv6Network]  – may be empty
+                  None  – on configuration or parse error
+              """
               response = config_table.scan(
                   FilterExpression=Attr('ConfigName').eq(config_name)
               )
@@ -250,8 +274,16 @@ Resources:
               if len(items) != 1:
                   logger.warning("Expected 1 item for %s, found %d", config_name, len(items))
                   return None
+
+              ip_list = []
+              for ip in items[0].get('IPs', []):
+                  ip_list.append(ip)
+
+              if not isinstance(ip_list, list):
+                  logger.error("IPs field for %s is not a list", config_name)
+                  return None
               networks = []
-              for entry in items[0].get('IPs', []):
+              for entry in ip_list:
                   try:
                       networks.append(ipaddress.ip_network(entry, strict=False))
                   except ValueError as exc:
@@ -261,6 +293,7 @@ Resources:
 
 
           def report_ip_banned(address):
+              """Return True if *address* matches any network in the BannedIPs config."""
               networks = _get_config_networks("BannedIPs")
               if not networks:
                   return False
@@ -272,12 +305,14 @@ Resources:
 
 
           def report_ip_permitted(address):
-              """Return True if address is allowed. An empty list means open access."""
+              """Return True if *address* is allowed. An empty PermittedIPs list means open access."""
               networks = _get_config_networks("PermittedIPs")
               if networks is None:
-                  return False  # config error – fail closed
+                  # Config error – fail closed (deny)
+                  return False
               if not networks:
-                  return True   # no restrictions configured
+                  # No restrictions configured
+                  return True
               for network in networks:
                   if address.version == network.version and address in network:
                       logger.info("Address %s is permitted (matched %s)", address, network)
@@ -286,12 +321,18 @@ Resources:
               return False
 
 
-          # ── Hostname-based access control ─────────────────────────────────────
+          # ---------------------------------------------------------------------------
+          # Hostname-based access control
+          # ---------------------------------------------------------------------------
 
           def report_hostname_permitted(event):
-              """Validate body and check each report URL against the banned hostname list."""
+              """Validate the request body and check each report URL against the banned hostname list."""
               if 'body' not in event:
                   logger.warning("Rejected: no body in event")
+                  return False
+
+              if event.get('httpMethod', '').lower() != 'post':
+                  logger.warning("Rejected: unexpected HTTP method %s", event.get('httpMethod'))
                   return False
 
               if len(event['body']) > MAX_BODY_BYTES:
@@ -308,7 +349,7 @@ Resources:
                   logger.warning("Rejected: body is not a JSON array")
                   return False
 
-              # Fetch banned hostnames config once, outside the per-report loop
+              # Fetch the banned hostnames config once, outside the per-report loop
               response = config_table.scan(
                   FilterExpression=Attr('ConfigName').eq("BannedServerHostnames")
               )
@@ -328,21 +369,21 @@ Resources:
               return True
 
 
-          # ── Source address helpers ────────────────────────────────────────────
+          # ---------------------------------------------------------------------------
+          # Source address helpers
+          # ---------------------------------------------------------------------------
 
           def report_src_addr(event):
-              """Extract the caller's IP address from the Lambda Function URL request context."""
+              """Extract the caller's IP address from the API Gateway request context."""
               try:
-                  return ipaddress.ip_address(
-                      event['requestContext']['http']['sourceIp']
-                  )
+                  return ipaddress.ip_address(event['requestContext']['identity']['sourceIp'])
               except (KeyError, TypeError, ValueError) as exc:
                   logger.warning("Could not parse source IP: %s", exc)
                   return False
 
 
           def parse_X_Forwarded_For(event):
-              """Parse public IP addresses from X-Forwarded-For, skipping loopback/private."""
+              """Parse public IP addresses from the X-Forwarded-For header, skipping loopback/private."""
               xff = event.get('headers', {}).get('X-Forwarded-For')
               if not xff:
                   return False
@@ -360,10 +401,16 @@ Resources:
               return addresses
 
 
-          # ── Internal helpers ──────────────────────────────────────────────────
+          # ---------------------------------------------------------------------------
+          # Internal helpers
+          # ---------------------------------------------------------------------------
 
           def _content_type_ok(event):
+              """Return True if the request carries the expected Content-Type for NEL reports."""
+
               headers = event.get('headers') or {}
+              # API Gateway normalises header names to lowercase in some configurations;
+              # check both cases to be safe.
               ct = headers.get('content-type') or headers.get('Content-Type') or ''
               return ct.lower().startswith(NEL_CONTENT_TYPE)
 
@@ -376,7 +423,6 @@ Resources:
                   'statusCode': status_code,
                   'body': json.dumps(body),
               }
-
   # ── Lambda Function URL ───────────────────────────────────────────────────────
   # AuthType NONE is intentional: browsers submit NEL reports without credentials.
   # Consider adding an AWS WAF WebACL association for rate limiting and geo-blocking.
